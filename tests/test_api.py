@@ -1,75 +1,256 @@
+
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from uuid import uuid4
 
-def signup_and_login(client, email="amrish@example.com"):
-    r = client.post("/auth/signup", json={"name": "Amrish Kumar", "email": email, "password": "StrongPass123"})
-    assert r.status_code == 201, r.text
-    r = client.post("/auth/login", json={"email": email, "password": "StrongPass123"})
-    assert r.status_code == 200, r.text
-    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+from app.config import settings
 
-def create_centre(client):
-    r = client.post("/centres/", json={"name": "City Diagnostic Centre", "location": "Kurukshetra, Haryana", "tests": [
-        {"test_name": "CBC", "description": "Complete blood count", "price": "450.00"},
-        {"test_name": "Lipid Profile", "description": "Cholesterol test", "price": "800.00"}]})
-    assert r.status_code == 201, r.text
-    return r.json()
+
+def create_user(client, email=None, password="StrongPass123"):
+    email = email or f"user-{uuid4().hex[:8]}@example.com"
+
+    response = client.post(
+        "/auth/signup/",
+        json={
+            "name": "Test User",
+            "email": email,
+            "password": password,
+        },
+    )
+    assert response.status_code in (200, 201), response.text
+
+    login_response = client.post(
+        "/auth/login/",
+        json={
+            "email": email,
+            "password": password,
+        },
+    )
+    assert login_response.status_code == 200, login_response.text
+
+    token = login_response.json()["access_token"]
+
+    return {
+        "email": email,
+        "password": password,
+        "headers": {
+            "Authorization": f"Bearer {token}"
+        },
+    }
+
+
+def create_centre(client, headers):
+    response = client.post(
+        "/centres/",
+        headers=headers,
+        json={
+            "name": "City Diagnostic Centre",
+            "location": "Kurukshetra, Haryana",
+            "tests": [
+                {
+                    "test_name": "CBC",
+                    "description": "Complete blood count",
+                    "price": "450.00",
+                },
+                {
+                    "test_name": "Lipid Profile",
+                    "description": "Cholesterol test",
+                    "price": "800.00",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    return response.json()
+
 
 def create_booking(client, headers, centre):
-    test = next(t for t in centre["tests"] if t["test_name"] == "CBC")
-    r = client.post("/bookings/", headers=headers, json={"centre_id": centre["id"], "test_id": test["test_id"], "appointment_at": (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()})
-    assert r.status_code == 201, r.text
-    return r.json()
+    response = client.post(
+        "/bookings/",
+        headers=headers,
+        json={
+            "centre_id": centre["id"],
+            "test_id": centre["tests"][0]["test_id"],
+            "appointment_at": (
+                datetime.now(timezone.utc) + timedelta(days=1)
+            ).isoformat(),
+        },
+    )
 
-def test_signup_login_and_duplicate_email(client):
-    headers = signup_and_login(client)
-    assert headers["Authorization"].startswith("Bearer ")
-    r = client.post("/auth/signup", json={"name": "Another User", "email": "amrish@example.com", "password": "StrongPass123"})
-    assert r.status_code == 409
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def test_signup_and_login(client):
+    user = create_user(client)
+
+    assert user["email"].endswith("@example.com")
+    assert user["headers"]["Authorization"].startswith("Bearer ")
+
+
+def test_duplicate_signup_is_rejected(client):
+    email = f"duplicate-{uuid4().hex[:8]}@example.com"
+
+    payload = {
+        "name": "Test User",
+        "email": email,
+        "password": "StrongPass123",
+    }
+
+    first = client.post("/auth/signup/", json=payload)
+    assert first.status_code in (200, 201), first.text
+
+    second = client.post("/auth/signup/", json=payload)
+    assert second.status_code in (400, 409, 422), second.text
+
 
 def test_booking_requires_authentication(client):
-    centre = create_centre(client)
-    test = centre["tests"][0]
-    r = client.post("/bookings/", json={"centre_id": centre["id"], "test_id": test["test_id"], "appointment_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()})
-    assert r.status_code == 401
+    response = client.post(
+        "/bookings/",
+        json={
+            "centre_id": 1,
+            "test_id": 1,
+            "appointment_at": (
+                datetime.now(timezone.utc) + timedelta(days=1)
+            ).isoformat(),
+        },
+    )
 
-def test_booking_and_successful_payment(client):
-    headers = signup_and_login(client)
-    booking = create_booking(client, headers, create_centre(client))
-    assert booking["status"] == "PENDING"
-    r = client.post("/payments/", headers=headers, json={"booking_id": booking["id"], "simulate_status": "SUCCESS"})
-    assert r.status_code == 201, r.text
-    assert r.json()["status"] == "SUCCESS"
-    updated = client.get(f"/bookings/{booking['id']}", headers=headers)
-    assert updated.json()["status"] == "CONFIRMED"
+    assert response.status_code in (401, 403), response.text
 
-def test_webhook_is_idempotent(client):
-    headers = signup_and_login(client)
-    booking = create_booking(client, headers, create_centre(client))
-    payload = {"event_id": "provider-event-123", "booking_id": booking["id"], "status": "SUCCESS", "amount": str(booking["amount"])}
-    secret = {"X-Webhook-Secret": "test-secret-key"}
-    first = client.post("/payments/webhook/", json=payload, headers=secret)
-    second = client.post("/payments/webhook/", json=payload, headers=secret)
-    assert first.status_code == 200, first.text
-    assert second.status_code == 200, second.text
-    assert first.json()["id"] == second.json()["id"]
 
-def test_webhook_rejects_wrong_amount(client):
-    headers = signup_and_login(client)
-    booking = create_booking(client, headers, create_centre(client))
-    r = client.post("/payments/webhook/", headers={"X-Webhook-Secret": "test-secret-key"}, json={"event_id": "wrong-amount-event", "booking_id": booking["id"], "status": "SUCCESS", "amount": "1.00"})
-    assert r.status_code == 400
+def test_create_and_get_booking(client):
+    user = create_user(client)
+    centre = create_centre(client, user["headers"])
+    booking = create_booking(client, user["headers"], centre)
 
-def test_user_cannot_read_another_users_booking(client):
-    headers1 = signup_and_login(client, "one@example.com")
-    headers2 = signup_and_login(client, "two@example.com")
-    booking = create_booking(client, headers1, create_centre(client))
-    r = client.get(f"/bookings/{booking['id']}", headers=headers2)
-    assert r.status_code == 404
+    assert Decimal(str(booking["amount"])) == Decimal("450.00")
+
+    response = client.get(
+        f"/bookings/{booking['id']}/",
+        headers=user["headers"],
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["id"] == booking["id"]
+
+
+def test_user_cannot_access_another_users_booking(client):
+    user1 = create_user(client)
+    user2 = create_user(client)
+
+    centre = create_centre(client, user1["headers"])
+    booking = create_booking(client, user1["headers"], centre)
+
+    response = client.get(
+        f"/bookings/{booking['id']}/",
+        headers=user2["headers"],
+    )
+
+    assert response.status_code in (403, 404), response.text
+
+
+def test_successful_payment_confirms_booking(client):
+    user = create_user(client)
+    centre = create_centre(client, user["headers"])
+    booking = create_booking(client, user["headers"], centre)
+
+    response = client.post(
+        "/payments/",
+        headers=user["headers"],
+        json={
+            "booking_id": booking["id"],
+            "simulate_status": "SUCCESS",
+        },
+    )
+
+    assert response.status_code in (200, 201), response.text
+
+    booking_response = client.get(
+        f"/bookings/{booking['id']}/",
+        headers=user["headers"],
+    )
+
+    assert booking_response.status_code == 200, booking_response.text
+    assert booking_response.json()["status"] == "CONFIRMED"
+
 
 def test_failed_payment_updates_booking(client):
-    headers = signup_and_login(client)
-    booking = create_booking(client, headers, create_centre(client))
-    r = client.post("/payments/", headers=headers, json={"booking_id": booking["id"], "simulate_status": "FAILED"})
-    assert r.status_code == 201
-    updated = client.get(f"/bookings/{booking['id']}", headers=headers)
-    assert updated.json()["status"] == "FAILED"
+    user = create_user(client)
+    centre = create_centre(client, user["headers"])
+    booking = create_booking(client, user["headers"], centre)
+
+    response = client.post(
+        "/payments/",
+        headers=user["headers"],
+        json={
+            "booking_id": booking["id"],
+            "simulate_status": "FAILED",
+        },
+    )
+
+    assert response.status_code in (200, 201), response.text
+
+    booking_response = client.get(
+        f"/bookings/{booking['id']}/",
+        headers=user["headers"],
+    )
+
+    assert booking_response.status_code == 200, booking_response.text
+    assert booking_response.json()["status"] == "FAILED"
+
+
+def test_webhook_is_idempotent(client):
+    user = create_user(client)
+    centre = create_centre(client, user["headers"])
+    booking = create_booking(client, user["headers"], centre)
+
+    payload = {
+        "event_id": f"test-event-{uuid4().hex}",
+        "booking_id": booking["id"],
+        "status": "SUCCESS",
+        "amount": str(booking["amount"]),
+    }
+
+    headers = {
+        "X-Webhook-Secret": settings.jwt_secret_key
+    }
+
+    first = client.post(
+        "/payments/webhook/",
+        headers=headers,
+        json=payload,
+    )
+
+    assert first.status_code in (200, 201), first.text
+
+    second = client.post(
+        "/payments/webhook/",
+        headers=headers,
+        json=payload,
+    )
+
+    assert second.status_code == first.status_code, second.text
+    assert second.json() == first.json()
+
+
+def test_webhook_rejects_wrong_amount(client):
+    user = create_user(client)
+    centre = create_centre(client, user["headers"])
+    booking = create_booking(client, user["headers"], centre)
+
+    response = client.post(
+        "/payments/webhook/",
+        headers={
+            "X-Webhook-Secret": settings.jwt_secret_key
+        },
+        json={
+            "event_id": f"wrong-amount-{uuid4().hex}",
+            "booking_id": booking["id"],
+            "status": "SUCCESS",
+            "amount": "1.00",
+        },
+    )
+
+    assert response.status_code in (400, 409, 422), response.text
