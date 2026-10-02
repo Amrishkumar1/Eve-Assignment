@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.coverage
+htmlcov/
+.DS_Store
+eve_healthcare.db
+
+eve_healthcare.db
+*.db
+.env*
+!.env.example
+*~
